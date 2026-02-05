@@ -15,5 +15,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=/home/manhquan/esp/esp-idf/ESP_Projects/PPG_ECG_PCG_Prj01/build"
-  ]
+  ],
+  "idf.currentSetup": "/home/manhquan/esp/esp-idf"
 }

@@ -2,108 +2,94 @@ import serial
 import time
 import os
 import pandas as pd
-import threading
 
 # --- CẤU HÌNH ---
-SERIAL_PORT = '/dev/ttyUSB0'  # Kiểm tra lại cổng USB của bạn (vd: /dev/ttyACM0)
-BAUD_RATE = 115200
-OUTPUT_FOLDER = 'result'
+SERIAL_PORT = '/dev/ttyUSB0'  # Sửa đúng cổng COM/TTY
+BAUD_RATE = 921600            
+OUTPUT_FOLDER = 'result'      # Tên thư mục kết quả
 
-# Biến lưu dữ liệu
-data_ecg = []
+# CẤU HÌNH KIỂM TRA (Khớp với Firmware)
+EXPECTED_FS = 1000            
+TOLERANCE = 0.1               
+
 data_ppg = []
-data_pcg = []
-
-def parse_line(line):
-    line = line.strip()
-    if not line: return None
-    
-    # Tách loại dữ liệu và giá trị (Ví dụ: "E,1234")
-    parts = line.split(',')
-    if len(parts) < 2: return None
-    
-    tag = parts[0]
-    try:
-        # Nếu dòng có nhiều giá trị (VD: P,Red,IR)
-        if tag == 'P' and len(parts) >= 3:
-            return ('P', int(parts[1]), int(parts[2]))
-        
-        # Nếu dòng có 1 giá trị (E hoặc A)
-        val = int(parts[1])
-        return (tag, val)
-    except ValueError:
-        return None
 
 def save_data():
+    # 1. Tự động tạo thư mục nếu chưa có
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
-        print(f"Created folder: {OUTPUT_FOLDER}")
-
-    # Lưu ECG
-    df_ecg = pd.DataFrame(data_ecg, columns=['Value'])
-    df_ecg.to_csv(f'{OUTPUT_FOLDER}/ecg.csv', index_label='Index')
+        print(f"[INFO] Đã tạo thư mục mới: {OUTPUT_FOLDER}")
     
-    # Lưu PPG (Red, IR)
-    df_ppg = pd.DataFrame(data_ppg, columns=['Red', 'IR'])
-    df_ppg.to_csv(f'{OUTPUT_FOLDER}/ppg.csv', index_label='Index')
-
-    # Lưu PCG
-    df_pcg = pd.DataFrame(data_pcg, columns=['Value'])
-    df_pcg.to_csv(f'{OUTPUT_FOLDER}/pcg.csv', index_label='Index')
-
-    print(f"\nSaved {len(data_ecg)} ECG samples")
-    print(f"Saved {len(data_ppg)} PPG samples")
-    print(f"Saved {len(data_pcg)} PCG samples")
-    print(f"Files saved in '{OUTPUT_FOLDER}/' directory.")
+    # 2. Lưu file CSV vào trong thư mục đó
+    file_path = os.path.join(OUTPUT_FOLDER, 'ppg.csv')
+    
+    df = pd.DataFrame(data_ppg, columns=['SampleID', 'Red', 'IR'])
+    df.to_csv(file_path, index=False)
+    print(f"\n[DONE] Đã lưu {len(df)} mẫu vào file: {file_path}")
 
 def main():
+    print(f"--- KẾT NỐI {SERIAL_PORT} @ {BAUD_RATE} ---")
+    print(f"--- MỤC TIÊU: {EXPECTED_FS} Hz (Lưu vào '{OUTPUT_FOLDER}') ---")
+
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print(f"Connected to {SERIAL_PORT}. Waiting for data...")
-        print("Press Ctrl+C to force stop.")
-        
-        # Reset ESP32 để bắt đầu đo lại từ đầu
-        ser.setDTR(False)
-        time.sleep(0.05)
-        ser.setDTR(True)
+        ser.setDTR(False); time.sleep(0.05); ser.setDTR(True) # Reset ESP32
+    except Exception as e:
+        print(f"Lỗi mở cổng Serial: {e}")
+        return
 
-        start_time = time.time()
-        
+    print("Đang đợi dữ liệu...")
+    
+    start_time = time.time()
+    last_check_time = start_time
+    total_samples = 0
+    samples_in_last_sec = 0
+    last_sample_id = -1
+    lost_packets = 0
+
+    try:
         while True:
-            try:
-                # Đọc từng dòng từ ESP32
-                line = ser.readline().decode('utf-8', errors='ignore')
-                
-                # Kiểm tra tín hiệu dừng từ Firmware
-                if "MEASUREMENT_DONE" in line:
-                    print("\nReceived STOP signal from ESP32.")
-                    break
-                
-                parsed = parse_line(line)
-                if parsed:
-                    tag = parsed[0]
-                    if tag == 'E':
-                        data_ecg.append(parsed[1])
-                    elif tag == 'P':
-                        data_ppg.append((parsed[1], parsed[2]))
-                    elif tag == 'A':
-                        data_pcg.append(parsed[1])
-                
-                # In trạng thái mỗi giây
-                if time.time() - start_time > 1:
-                    print(f"\rCollecting... E:{len(data_ecg)} | P:{len(data_ppg)} | A:{len(data_pcg)}", end="")
-                    start_time = time.time()
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            
+            if "MEASUREMENT_DONE" in line:
+                print("\n[STOP] Nhận tín hiệu dừng từ ESP32.")
+                break
 
-            except UnicodeDecodeError:
-                continue
+            if not line: continue
+
+            parts = line.split(',')
+            
+            # Format: P, Sample_ID, Red, IR
+            if len(parts) == 4 and parts[0] == 'P':
+                try:
+                    s_id = int(parts[1])
+                    red = int(parts[2])
+                    ir  = int(parts[3])
+                    
+                    if last_sample_id != -1:
+                        diff = s_id - last_sample_id
+                        if diff > 1: lost_packets += (diff - 1)
+                    
+                    last_sample_id = s_id
+                    data_ppg.append((s_id, red, ir))
+                    total_samples += 1
+                    samples_in_last_sec += 1
+
+                except ValueError: pass
+
+            # Monitor mỗi giây
+            current_time = time.time()
+            if current_time - last_check_time >= 1.0:
+                fps = samples_in_last_sec / (current_time - last_check_time)
+                quality = "OK" if abs(fps - EXPECTED_FS) <= (EXPECTED_FS * TOLERANCE) else "BAD"
+                print(f"Time: {int(current_time - start_time)}s | FPS: {int(fps)} | Lost: {lost_packets} | -> {quality}")
+                samples_in_last_sec = 0
+                last_check_time = current_time
 
     except KeyboardInterrupt:
-        print("\nForce stopping...")
-    except Exception as e:
-        print(f"Error: {e}")
+        print("\n[USER STOP]")
     finally:
-        if 'ser' in locals() and ser.is_open:
-            ser.close()
+        if 'ser' in locals() and ser.is_open: ser.close()
         save_data()
 
 if __name__ == "__main__":
